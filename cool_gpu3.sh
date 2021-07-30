@@ -5,11 +5,17 @@
 # This script works by generating a new xconfig for each GPU and setting them as the primary device.
     
 # Paths to the utilities we will need
-SMI=$(which nvidia-smi)
-SET=$(which nvidia-settings)
+if [[ -x "$(command -v nvidia-smi)" ]]; then
+    SMI=$(which nvidia-smi)
+fi
+if [[ -x "$(command -v nvidia-settings)" ]]; then
+    SET=$(which nvidia-settings)
+fi
 
 # Determine major driver version
-VER=$(awk '/NVIDIA/ {print $8}' /proc/driver/nvidia/version | cut -d . -f 1)
+if [[ -f "/proc/driver/nvidia/version" ]]; then
+    VER=$(awk '/NVIDIA/ {print $8}' /proc/driver/nvidia/version | cut -d . -f 1)
+fi
 
 if [ "$EUID" -ne 0 ]
   then echo "This script needs to be ran as root!"
@@ -42,7 +48,7 @@ function generateX() {
     # First argument should be the bus ID
     
     echo "Generating xconfig..."
-    nvidia-xconfig --allow-empty-initial-configuration --cool-bits=28 --busid=PCI:$1 --device=Device0 &> /dev/null
+    nvidia-xconfig --allow-empty-initial-configuration --cool-bits=28 --busid=PCI:$1 --device=Device0 > /dev/null 2>&1
 }
 
 function setFanState() {
@@ -54,16 +60,16 @@ function setFanState() {
         if [ "$2" -eq "$2" ] 2>/dev/null && [ "0$2" -ge "40" ]  && [ "0$2" -le "100" ]; then
             echo "Setting manual fan speed of $2%..."
         
-            xinit ${SET} -a [gpu:0]/GPUFanControlState=1 -a [fan:0]/GPUTargetFanSpeed=$2 -- :0 -once &> /dev/null
+            xinit ${SET} -a [gpu:0]/GPUFanControlState=1 -a [fan:0]/GPUTargetFanSpeed=$2 -- :0 -once > /dev/null 2>&1
             
             # Disable the GeForce LED on 10 series and older cards.
-            xinit ${SET} --assign GPULogoBrightness=0 &> /dev/null
+            xinit ${SET} --assign GPULogoBrightness=100 > /dev/null 2>&1
         else
             echo "Invalid fan speed!"
         fi
     else
         echo "Setting automatic fan speed..."
-        xinit ${SET} -a [gpu:0]/GPUFanControlState=0 -- :0 -once &> /dev/null
+        xinit ${SET} -a [gpu:0]/GPUFanControlState=0 -- :0 -once > /dev/null 2>&1
     fi
 }
 
@@ -91,6 +97,7 @@ function setFanStateAMD() {
         ls -d1 /sys/class/drm/card*/device/hwmon/hwmon* | while read -r dir; do
                 echo "Applying changes to: $dir"
                 echo 0 > "$dir/pwm1_enable"
+                echo 0 > "$dir/pwm1"
             done
     fi
 }
@@ -107,57 +114,79 @@ function applyChanges() {
     # $2: Fan speed
     
     amdgputotal=$(findAMDGPU)
-    nvgputotal=$($SMI --query-gpu=pci.bus_id,gpu_name --format=csv,noheader | wc -l)
-    
-    if [[ $amdgputotal -gt 0 ]]; then
-        echo "AMD GPU found ($amdgputotal)!"
-        setFanStateAMD 1 $2
+
+    if ! [[ -z "$SMI" ]]; then
+        nvgputotal=$($SMI --query-gpu=pci.bus_id,gpu_name --format=csv,noheader | wc -l)
+    else
+        nvgputotal=0
     fi
-    
-    if [[ $nvgputotal -gt 0 ]]; then
-        echo "NVIDIA GPU found ($nvgputotal)!"
 
-        # Drivers from 285.x.y on allow persistence mode setting
-        if [ ${VER} -lt 285 ]; then
-            echo "Error: Current driver version is ${VER}. Driver version must be greater than 285."; exit 1;
+    if [[ ! "$3" == "nvidia" ]]; then
+        if [[ $amdgputotal -gt 0 ]]; then
+       	    echo "AMD GPU found ($amdgputotal)!"
+            setFanStateAMD $1 $2
         fi
+    fi
 
-        backupX
-        rm -f /etc/X11/xorg.conf
+    if [[ ! "$3" == "amd" ]]; then
+        if [[ $nvgputotal -gt 0 ]]; then
+            echo "NVIDIA GPU found ($nvgputotal)!"
+
+            # Drivers from 285.x.y on allow persistence mode setting
+            if [ ${VER} -lt 285 ]; then
+                echo "Error: Current driver version is ${VER}. Driver version must be greater than 285."; exit 1;
+            fi
+
+            backupX
+            rm -f /etc/X11/xorg.conf
+
+            i=0
     
-        # loop through each GPU and individually set fan speed
-        $SMI --query-gpu=pci.bus_id,gpu_name --format=csv,noheader | while read -r line; do
-            $SMI -pm 1 # enable persistance mode
-            BUS_ID=$(echo $line | cut -d, -f1 | cut -d: -f2-3)
-            NAME=$(echo $line | cut -d, -f2 | sed -e 's/^[ \t]*//')
+            # loop through each GPU and individually set fan speed
+            $SMI --query-gpu=pci.bus_id,gpu_name --format=csv,noheader | while read -r line; do
+                $SMI -pm 1 # enable persistance mode
+                BUS_ID=$(echo $line | cut -d, -f1 | cut -d: -f2-3)
+                NAME=$(echo $line | cut -d, -f2 | sed -e 's/^[ \t]*//')
 
-            echo -e "########################################\
+                echo -e "########################################\
 \nGPU BUS: $BUS_ID\
 \nGPU BUS FIXED: "$(busFix $BUS_ID)\
 "\nGPU NAME: '$NAME'\
 \n########################################"
         
-            generateX $(busFix $BUS_ID)
-        
-            if [[ "$1" == "0" ]]; then
-                # Auto fan speed
-                # disable persistance mode
-                $SMI -pm 0
+                generateX $(busFix $BUS_ID)
+
+                if [[ "$1" == "0" ]]; then
+                    # Auto fan speed
+                    # disable persistance mode
+                    $SMI -pm 0
                 
-                setFanState 0
-            else
-                # Manual fan speed
-                setFanState 1 $2
-                
-                # set some overclocks
-                 #xinit ${SET} -a [gpu:0]/GPUMemoryTransferRateOffset[2]=500 > /dev/null 2>&1
-                 #xinit ${SET} -a [gpu:0]/GPUMemoryTransferRateOffset[3]=500 > /dev/null 2>&1
-            fi
-        done
+                    setFanState 0
+                else
+                    # Manual fan speed
+                    setFanState 1 $2
+
+                    #if [[ "$NAME" == "TITAN Xp" ]]; then
+                        echo "Setting over/underclocks for GPU..."
+                        xinit ${SET} -a [gpu:0]/GPUGraphicsClockOffset[2]=-100 > /dev/null 2>&1
+                        xinit ${SET} -a [gpu:0]/GPUGraphicsClockOffset[3]=-100 > /dev/null 2>&1
+                        #xinit ${SET} -a [gpu:0]/GPUMemoryTransferRateOffset[2]=1000 > /dev/null 2>&1
+                        #xinit ${SET} -a [gpu:0]/GPUMemoryTransferRateOffset[3]=1000 > /dev/null 2>&1
+                        ${SMI} -i $i -pl 185
+                    #fi
+
+                    # set some overclocks
+                    #xinit ${SET} -a [gpu:0]/GPUMemoryTransferRateOffset[2]=500 > /dev/null 2>&1
+                    #xinit ${SET} -a [gpu:0]/GPUMemoryTransferRateOffset[3]=500 > /dev/null 2>&1
+               fi
+
+               i=$(($i+1))
+            done
     
-        restoreX
-        sleep 2
-        $SMI
+            restoreX
+            sleep 2
+            $SMI
+        fi
     fi
 }
 
@@ -166,7 +195,7 @@ if [ "$1" -eq "$1" ] 2>/dev/null && [ "0$1" -ge "40" ]  && [ "0$1" -le "100" ]; 
     echo "Setting fan to $1%."
 
     # start an x session, and call nvidia-settings to enable fan control and set speed
-    applyChanges 1 $1
+    applyChanges 1 $1 $2
 
     echo "Complete"
 else
